@@ -4,631 +4,402 @@
 # Modifications Copyright (c) SCALE Lab, Brown University.
 # These modifications are licensed under the MIT license (see LICENSE).
 
+"""
+LoRA DPO fine-tuning script using HuggingFace Transformers, PEFT, and TRL.
+"""
+
+import argparse
 import csv
-from finetune.utils import pc_instruction, pc_questions_txt_file, custom_prompts, format_instruction, eval_pc, eval_custom_prompts, clean_output
-from torchtune.modules import KVCache
-from torchtune.data import AlpacaInstructTemplate
-from tqdm import tqdm
-from torchtune.recipe_interfaces import FTRecipeInterface
-from torchtune.modules.peft.peft_utils import (
-    disable_adapter,
-    get_adapter_params,
-    get_merged_lora_ckpt,
-    set_trainable_params,
-    validate_state_dict_for_lora,
-)
-from torchtune.datasets import ConcatDataset
-from torchtune.data import CROSS_ENTROPY_IGNORE_IDX
-from torchtune import config, modules, utils
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim import Optimizer
-from torch import nn
-from omegaconf import DictConfig, ListConfig
-import torch
-from warnings import warn
-from typing import Any, Dict, Optional, Tuple
-from functools import partial
-import sys
-import time
+import json
+import logging
 import os
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
 
-dir_path = os.path.dirname(os.path.realpath(__file__))
-parent_dir_path = os.path.abspath(os.path.join(dir_path, os.pardir))
-sys.path.insert(0, dir_path)
-sys.path.insert(0, parent_dir_path)
+import torch
+from peft import LoraConfig, get_peft_model, TaskType
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    set_seed,
+)
+from trl import DPOConfig, DPOTrainer
+
+from finetune.utils import (
+    pc_instruction,
+    pc_questions_txt_file,
+    custom_prompts,
+    format_instruction_alpaca,
+    eval_pc,
+    eval_custom_prompts,
+)
+from data.datasets import politune_left, politune_right
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 
-log = utils.get_logger("DEBUG")
+def get_torch_dtype(dtype_str: str) -> torch.dtype:
+    """Convert string dtype to torch dtype."""
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }
+    return dtype_map.get(dtype_str.lower(), torch.bfloat16)
 
 
-class LoRADPORecipeSingleDevice(FTRecipeInterface):
-    """
-    LoRA DPO recipe for dense transformer-based LLMs such as Llama2 for
-    single device training. This is based on HF's DPOTrainer in the
-    TRL library: https://github.com/huggingface/trl/blob/main/trl/trainer/dpo_trainer.py#L65
+def setup_pc_evaluation(output_dir: str, tokenizer):
+    """Setup political compass evaluation."""
+    pc_questions = []
+    with open(pc_questions_txt_file, "r") as f:
+        for line in f:
+            question = line.strip()
+            if question:
+                formatted = format_instruction_alpaca(pc_instruction, question)
+                pc_questions.append(formatted)
+    
+    pc_csv_file = os.path.join(output_dir, "pc.csv")
+    pc_headers = ['iteration', 'step'] + [f"question_{i}" for i in range(len(pc_questions))]
+    with open(pc_csv_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(pc_headers)
+    
+    return pc_questions, pc_csv_file
 
-    This recipe supports:
-        - Activation checkpointing. This is enabled by default but is configurable.
-        - Full bf16 training for supported HW architectures. We currently check bf16 support via
-        the `torch.cuda.is_bf16_supported` API. This is disabled by default but can be enabled via
-        setting `dtype=bf16` in configuration.
-        - Checkpointing: of LoRA adapter parameters and their optimizer states. When resuming
-            from a checkpoint, the adapter parameters are loaded from the checkpoint along
-            with the base model weights. Note that intra-epoch resumption is not supported.
-        - Logging to terminal, WandB, or TensorBoard.
 
-    Assumptions:
-        - Checkpoints are ONLY saved at epoch boundaries. In case of failure, work done
-            in ongoing epoch is lost.
-        - Datasets are Map-style and data fits in memory (not streamed).
+def setup_custom_prompts_evaluation(output_dir: str, tokenizer):
+    """Setup custom prompts evaluation."""
+    formatted_prompts = [format_instruction_alpaca(q) for q in custom_prompts]
+    
+    custom_prompts_file = os.path.join(output_dir, "custom_instrs.csv")
+    headers = ['iteration', 'step'] + [f"prompt_{i}" for i in range(len(formatted_prompts))]
+    with open(custom_prompts_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+    
+    return formatted_prompts, custom_prompts_file
 
-    The following configs can be used to run this recipe:
-        >>> tune ls
-        RECIPE                          CONFIG
-        lora_dpo_single_device          llama2/7B_lora_dpo_single_device
 
-    Args:
-        cfg (DictConfig): OmegaConf object parsed from yaml file
+def load_config(config_path: str) -> dict:
+    """Load configuration from JSON file."""
+    with open(config_path, 'r') as f:
+        return json.load(f)
 
-    Raises:
-        ValueError: If ``dtype`` is set to fp16.
-        RuntimeError: If ``dtype`` is set to bf16 and the hardware does not support bf16.
 
-    """
-
-    def __init__(self, cfg: DictConfig) -> None:
-
-        self._device = utils.get_device(device=cfg.device)
-        # Reduced precision logic
-        self._dtype = utils.get_dtype(cfg.dtype, device=self._device)
-        # fp16 precision is explicitly disabled as it is not supported in this
-        # recipe (for example, no gradient scaling).
-        if self._dtype == torch.float16:
-            raise ValueError(
-                "fp16 precision is not supported in this recipe. Please use fp32 or bf16."
-            )
-        # For CUDA devices, check if the HW supports bf16 if bf16 is specified.
-        if (
-            self._dtype == torch.bfloat16
-            and self._device != torch.device("cpu")
-            and not torch.cuda.is_bf16_supported()
-        ):
-            raise RuntimeError(
-                "Full bf16 training is not supported on this hardware.")
-        # logging attributes
-        self._output_dir = cfg.output_dir
-        os.makedirs(self._output_dir, exist_ok=True)
-        self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
-        self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
-
-        # These are public properties which are updated by the checkpoint loader
-        # when ``resume_from_checkpoint`` is `True` or validated in tests
-        self.seed = utils.set_seed(seed=cfg.seed)
-        self.epochs_run = 0
-        self.total_epochs = cfg.epochs
-        self.max_steps_per_epoch = cfg.max_steps_per_epoch
-        self.global_step = 0
-
-        self._resume_from_checkpoint = cfg.resume_from_checkpoint
-        self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
-        self._template = AlpacaInstructTemplate()
-        self._pc_instruction = pc_instruction
-        self._pc_questions = []
-        with open(pc_questions_txt_file, "r") as f:
-            for line in f:
-                self._pc_questions.append(
-                    self.generate_pc_instruction(line.strip()))
-
-        self._custom_prompts = custom_prompts
-        self._custom_prompts = [self.format_instruction(
-            q) for q in self._custom_prompts]
-
-        self._pc_num_questions = len(self._pc_questions)
-        self._pc_csv_file = f"{self._output_dir}/pc.csv"
-        self._pc_headers = ['iteration', 'step'] + \
-            [f"question_{str(i)}" for i in range(self._pc_num_questions)]
-        with open(self._pc_csv_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self._pc_headers)
-
-        self._custom_prompts_file = f"{self._output_dir}/custom_instrs.csv"
-        headers = ['iteration', 'step'] + \
-            [f"prompt_{str(i)}" for i in range(len(self._custom_prompts))]
-        with open(self._custom_prompts_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-        self._eval_freq = cfg.get("eval_freq", 512)
-        self._max_generated_tokens = 300
-        self._temperature = 0.3
-        self._top_k = 200
-
-        log.info(f"Evaluation frequency: {self._eval_freq}")
-        log.info(f"Max generated tokens: {self._max_generated_tokens}")
-        log.info(f"Temperature: {self._temperature}")
-        log.info(f"Top k: {self._top_k}")
-
-    def format_instruction(self, instr, inp=""):
-        return format_instruction(self._template, instr, inp)
-
-    def generate_pc_instruction(self, question):
-        return self.format_instruction(self._pc_instruction, question)
-
-    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
-        """
-        Extract the checkpoint state from file and validate. This includes the
-        base model weights. If resume_from_checkpoint is True, this also includes
-        the adapter weights and recipe state
-        """
-        self._checkpointer = config.instantiate(
-            cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
-        )
-        checkpoint_dict = self._checkpointer.load_checkpoint()
-
-        if self._resume_from_checkpoint:
-            if utils.ADAPTER_KEY not in checkpoint_dict:
-                raise ValueError(
-                    "Adapter weights not found. Please ensure a valid adapter checkpoint is provided."
-                )
-            # _update_recipe_state will throw an exception if the recipe state is not correctly loaded
-            # no need to check here
-            self._update_recipe_state(checkpoint_dict)
-        return checkpoint_dict
-
-    def _update_recipe_state(self, ckpt_dict: Dict[str, Any]) -> None:
-        """
-        Updates the recipe state from checkpoint.
-        """
-        # If seed, total_epoch or max_steps_per_epoch don't match,
-        # warn the user and overwrite
-        if (
-            self.seed != ckpt_dict[utils.SEED_KEY]
-            or self.total_epochs != ckpt_dict[utils.TOTAL_EPOCHS_KEY]
-            or self.max_steps_per_epoch != ckpt_dict[utils.MAX_STEPS_KEY]
-        ):
-            warn(
-                message="""Configured value for seed, epochs or max_steps_per_epoch
-                does not match the value stored in checkpoint."""
-            )
-        self.seed = utils.set_seed(seed=ckpt_dict[utils.SEED_KEY])
-        self.epochs_run = ckpt_dict[utils.EPOCHS_KEY]
-        self.total_epochs = ckpt_dict[utils.TOTAL_EPOCHS_KEY]
-        self.max_steps_per_epoch = ckpt_dict[utils.MAX_STEPS_KEY]
-
-    def setup(self, cfg: DictConfig) -> None:
-        """
-        Setup the recipe state. This includes recipe state (if resume_from_checkpoint is True),
-        model, tokenizer, loss, optimizer, learning rate scheduler, sampler, and dataloader.
-        """
-        self._metric_logger = config.instantiate(cfg.metric_logger)
-
-        # log config with parameter override
-        self._metric_logger.log_config(cfg)
-
-        checkpoint_dict = self.load_checkpoint(
-            cfg_checkpointer=cfg.checkpointer)
-
-        self._model = self._setup_model(
-            cfg_model=cfg.model,
-            enable_activation_checkpointing=cfg.enable_activation_checkpointing,
-            base_model_state_dict=checkpoint_dict[utils.MODEL_KEY],
-            lora_weights_state_dict=(
-                checkpoint_dict[utils.ADAPTER_KEY]
-                if self._resume_from_checkpoint
-                else None
-            ),
-        )
-
-        self._tokenizer = config.instantiate(cfg.tokenizer)
-        log.info("Tokenizer is initialized from file.")
-
-        self._optimizer = self._setup_optimizer(
-            cfg_optimizer=cfg.optimizer,
-            opt_state_dict=(
-                checkpoint_dict[utils.OPT_KEY] if self._resume_from_checkpoint else None
-            ),
-        )
-
-        self._loss_fn = config.instantiate(cfg.loss)
-        log.info("Loss is initialized.")
-
-        # Dataloader depends on the tokenizer and loss_fn and should be
-        # setup after all of these are setup
-        self._sampler, self._dataloader = self._setup_data(
-            cfg_dataset=cfg.dataset,
-            shuffle=cfg.shuffle,
-            batch_size=cfg.batch_size,
-        )
-
-        # Finally update the recipe state which can only be correctly set after all of the
-        # other components have been initialized and updated.
-
-        # Number of training steps in each epoch depends on the number of batches produced
-        # by the dataloader and the max_steps_per_epoch param set by the user and is used
-        # for logging and tracking training state. This should be computed after the dataloader
-        # has been setup
-        self._steps_per_epoch = (
-            len(self._dataloader) // self._gradient_accumulation_steps
-        )
-        if (
-            self.max_steps_per_epoch is not None
-            and self.max_steps_per_epoch < self._steps_per_epoch
-        ):
-            self._steps_per_epoch = self.max_steps_per_epoch
-            self.global_step = self.epochs_run * self._steps_per_epoch
-
-        # Learning rate scheduler can only be set up after number of steps
-        # has been computed
-        self._lr_scheduler = self._setup_lr_scheduler(
-            cfg_lr_scheduler=cfg.lr_scheduler,
-            num_training_steps=self.total_epochs * self._steps_per_epoch,
-            last_epoch=self.global_step - 1,
-        )
-
-        self._pc_questions = [torch.tensor(self._tokenizer.encode(
-            q, add_bos=True, add_eos=False), dtype=torch.int, device=self._device).to(self._device) for q in self._pc_questions[:]]
-        self._custom_prompts = [torch.tensor(self._tokenizer.encode(
-            q, add_bos=True, add_eos=False), dtype=torch.int, device=self._device).to(self._device) for q in self._custom_prompts[:]]
-        self._causal_mask = torch.tril(
-            torch.ones(self._model.max_seq_len,
-                       self._model.max_seq_len, dtype=torch.bool)
-        ).to(self._device)
-        self._kv_cache = []
-        for _ in self._model.layers:
-            self._kv_cache.append(KVCache(
-                batch_size=1,
-                max_seq_len=self._model.max_seq_len,
-                num_heads=self._model.num_heads,
-                head_dim=self._model.head_dim,
-                dtype=self._dtype,
-            ).to(self._device))
-
-    def _setup_model(
+class DPOTrainerWithEval(DPOTrainer):
+    """DPO Trainer with periodic evaluation callback."""
+    
+    def __init__(
         self,
-        cfg_model: DictConfig,
-        enable_activation_checkpointing: bool,
-        base_model_state_dict: Dict[str, Any],
-        lora_weights_state_dict: Optional[Dict[str, Any]] = None,
-    ) -> nn.Module:
-        with utils.set_default_dtype(self._dtype), self._device:
-            model = config.instantiate(cfg_model)
-        self._lora_rank = cfg_model.lora_rank
-        self._lora_alpha = cfg_model.lora_alpha
-        self.adapter_params = get_adapter_params(model)
-        set_trainable_params(model, self.adapter_params)
-
-        if enable_activation_checkpointing:
-            utils.set_activation_checkpointing(
-                model, auto_wrap_policy={modules.TransformerDecoderLayer}
+        *args,
+        eval_freq: int = 512,
+        pc_questions=None,
+        pc_csv_file=None,
+        custom_prompts_list=None,
+        custom_prompts_file=None,
+        max_generated_tokens=300,
+        temperature=0.3,
+        top_k=200,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.eval_freq = eval_freq
+        self.pc_questions = pc_questions or []
+        self.pc_csv_file = pc_csv_file
+        self.custom_prompts_list = custom_prompts_list or []
+        self.custom_prompts_file = custom_prompts_file
+        self.max_generated_tokens = max_generated_tokens
+        self.eval_temperature = temperature
+        self.eval_top_k = top_k
+        self._last_eval_step = -1
+    
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override training step to add periodic evaluation."""
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        
+        current_step = self.state.global_step
+        
+        # Run evaluation at specified frequency
+        if current_step > 0 and current_step % self.eval_freq == 0 and current_step != self._last_eval_step:
+            self._last_eval_step = current_step
+            self._run_custom_evaluation(current_step)
+        
+        return loss
+    
+    def _run_custom_evaluation(self, step):
+        """Run custom evaluation on PC questions and custom prompts."""
+        log.info(f"Running evaluation at step {step}")
+        
+        device = next(self.model.parameters()).device
+        epoch = self.state.epoch if self.state.epoch is not None else 0
+        
+        if self.pc_questions and self.pc_csv_file:
+            eval_pc(
+                pc_questions=self.pc_questions,
+                pc_csv_file=self.pc_csv_file,
+                model=self.model,
+                tokenizer=self.processing_class,
+                max_generated_tokens=self.max_generated_tokens,
+                temperature=self.eval_temperature,
+                top_k=self.eval_top_k,
+                iteration=int(epoch),
+                step=step,
+                device=str(device),
+            )
+        
+        if self.custom_prompts_list and self.custom_prompts_file:
+            eval_custom_prompts(
+                custom_prompts=self.custom_prompts_list,
+                custom_prompts_file=self.custom_prompts_file,
+                model=self.model,
+                tokenizer=self.processing_class,
+                max_generated_tokens=self.max_generated_tokens,
+                temperature=self.eval_temperature,
+                top_k=self.eval_top_k,
+                iteration=int(epoch),
+                step=step,
+                device=str(device),
             )
 
-        validate_state_dict_for_lora(
-            lora_attn_modules=cfg_model.lora_attn_modules,
-            apply_lora_to_mlp=cfg_model.apply_lora_to_mlp,
-            apply_lora_to_output=cfg_model.apply_lora_to_output,
-            full_model_state_dict_keys=model.state_dict().keys(),
-            lora_state_dict_keys=(
-                lora_weights_state_dict.keys()
-                if lora_weights_state_dict is not None
-                else None
-            ),
-            base_model_state_dict_keys=base_model_state_dict.keys(),
+
+def main():
+    parser = argparse.ArgumentParser(description="LoRA DPO Fine-tuning with HuggingFace")
+    parser.add_argument("--config", type=str, required=True, help="Path to config JSON file")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory (overrides config)")
+    parser.add_argument("--dataset", type=str, default=None, 
+                        help="Dataset: 'politune_left' or 'politune_right' (overrides config)")
+    args = parser.parse_args()
+    
+    # Load config
+    config = load_config(args.config)
+    
+    # Override config with command line args
+    if args.output_dir:
+        config["output_dir"] = args.output_dir
+    if args.dataset:
+        config["dataset"]["name"] = args.dataset
+    
+    # Extract config sections
+    model_config = config.get("model", {})
+    lora_config = config.get("lora", {})
+    training_config = config.get("training", {})
+    data_config = config.get("dataset", {})
+    eval_config = config.get("evaluation", {})
+    dpo_config = config.get("dpo", {})
+    
+    output_dir = config.get("output_dir", "outputs/dpo")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Set seed
+    seed = config.get("seed", 42)
+    if seed is not None:
+        set_seed(seed)
+    
+    log.info(f"Loading model: {model_config['name_or_path']}")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_config["name_or_path"],
+        trust_remote_code=True,
+    )
+    
+    # Ensure pad token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Load model
+    torch_dtype = get_torch_dtype(model_config.get("torch_dtype", "bfloat16"))
+    model = AutoModelForCausalLM.from_pretrained(
+        model_config["name_or_path"],
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2" if model_config.get("use_flash_attention_2", False) else None,
+    )
+    
+    # Load reference model (for DPO)
+    log.info("Loading reference model...")
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_config["name_or_path"],
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2" if model_config.get("use_flash_attention_2", False) else None,
+    )
+    
+    # Freeze reference model
+    for param in ref_model.parameters():
+        param.requires_grad = False
+    
+    # Setup LoRA for policy model
+    target_modules = lora_config.get("target_modules", ["q_proj", "v_proj"])
+    if isinstance(target_modules, str):
+        target_modules = [m.strip() for m in target_modules.split(",")]
+    
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_config.get("r", 16),
+        lora_alpha=lora_config.get("alpha", 32),
+        lora_dropout=lora_config.get("dropout", 0.05),
+        target_modules=target_modules,
+        bias="none",
+    )
+    
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+    
+    # Load dataset
+    dataset_name = data_config.get("name", "politune_left")
+    max_seq_length = data_config.get("max_seq_length", 1024)
+    max_samples = data_config.get("max_samples", None)
+    
+    log.info(f"Loading dataset: {dataset_name}")
+    
+    # Select appropriate dataset loader
+    if dataset_name == "politune_left" or dataset_name == "scale-lab/politune-left":
+        train_dataset = politune_left(
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_length,
+            max_samples=max_samples,
         )
-
-        model.load_state_dict(base_model_state_dict, strict=False)
-        if lora_weights_state_dict:
-            model.load_state_dict(lora_weights_state_dict, strict=False)
-
-        # Validate model adapter params were loaded in with the expected dtype
-        # TODO (rohan-varma): Further validation to ensure the appropriate base params
-        # are NF4 vs bf16 based on the quantization config.
-        utils.validate_expected_param_dtype(
-            self.adapter_params.items(), dtype=self._dtype
+    elif dataset_name == "politune_right" or dataset_name == "scale-lab/politune-right":
+        train_dataset = politune_right(
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_length,
+            max_samples=max_samples,
         )
-
-        log.info(f"Model is initialized with precision {self._dtype}.")
-        if self._device == torch.device("cuda"):
-            memory_stats = utils.get_memory_stats(device=self._device)
-            utils.log_memory_stats(memory_stats)
-        return model
-
-    def _setup_optimizer(
-        self, cfg_optimizer: DictConfig, opt_state_dict: Optional[Dict[str, Any]] = None
-    ) -> Optimizer:
-        optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
-        if opt_state_dict:
-            optimizer.load_state_dict(opt_state_dict)
-
-        log.info("Optimizer and loss are initialized.")
-        return optimizer
-
-    def _setup_lr_scheduler(
-        self,
-        cfg_lr_scheduler: DictConfig,
-        num_training_steps: int,
-        last_epoch: int,
-    ) -> Optimizer:
-        lr_scheduler = config.instantiate(
-            cfg_lr_scheduler,
-            self._optimizer,
-            num_training_steps=num_training_steps,
-            last_epoch=last_epoch,
+    else:
+        # Try loading as a HuggingFace dataset
+        from data.datasets import prepare_dpo_dataset
+        train_dataset = prepare_dpo_dataset(
+            source=dataset_name,
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_length,
+            max_samples=max_samples,
         )
-
-        log.info("Learning rate scheduler is initialized.")
-        return lr_scheduler
-
-    def _setup_data(
-        self,
-        cfg_dataset: DictConfig,
-        shuffle: bool,
-        batch_size: int,
-    ) -> Tuple[DistributedSampler, DataLoader]:
-        """
-        All data related setup happens here. Currently this recipe only supports
-        Map-style Datasets which fit into memory and an option for random shuffling.
-        Samplers, iterable datasets, and streaming datasets are not supported.
-        """
-        if isinstance(cfg_dataset, ListConfig):
-            datasets = [
-                config.instantiate(single_cfg_dataset,
-                                   tokenizer=self._tokenizer)
-                for single_cfg_dataset in cfg_dataset
-            ]
-            ds = ConcatDataset(datasets=datasets)
-        else:
-            ds = config.instantiate(cfg_dataset, tokenizer=self._tokenizer)
-
-        sampler = DistributedSampler(
-            ds,
-            num_replicas=1,
-            rank=0,
-            shuffle=shuffle,
-            seed=0,
-        )
-        dataloader = DataLoader(
-            dataset=ds,
-            sampler=sampler,
-            batch_size=batch_size,
-            collate_fn=partial(
-                utils.padded_collate_dpo,
-                padding_idx=self._tokenizer.pad_id,
-                ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
-            ),
-        )
-        log.info("Dataset and Sampler are initialized.")
-
-        return sampler, dataloader
-
-    def eval_pc(self, iteration=0, step=0):
-        return eval_pc(pc_questions=self._pc_questions, pc_csv_file=self._pc_csv_file, log=log, model=self._model, tokenizer=self._tokenizer, causal_mask=self._causal_mask, kv_cache=self._kv_cache, max_generated_tokens=self._max_generated_tokens, temperature=self._temperature, top_k=self._top_k, iteration=iteration, step=step)
-
-    def eval_custom_prompts(self, iteration=0, step=0):
-        return eval_custom_prompts(custom_prompts=self._custom_prompts, custom_prompts_file=self._custom_prompts_file, log=log, model=self._model, tokenizer=self._tokenizer, causal_mask=self._causal_mask, kv_cache=self._kv_cache, max_generated_tokens=self._max_generated_tokens, temperature=self._temperature, top_k=self._top_k, iteration=iteration, step=step)
-
-    def save_checkpoint(self, step: str) -> None:
-        """
-        Checkpoint the state of the recipe. The constructed checkpoint state dict
-        contains the following information:
-        - Merged weights with key MODEL_KEY
-        - Adapter weights with key ADAPTER_KEY
-        - Relevant recipe state if training is not complete
-
-        Checkpointer will save the merged weights, adapter weights and recipe state in
-        different checkpoint files. To correctly resume from training, the adapter weights
-        and recipe state must be provided along with the base model weights.
-        """
-        ckpt_dict = {}
-        # if training is in-progress, checkpoint the optimizer state as well
-        # if epoch + 1 < self.total_epochs:
-        ckpt_dict.update(
-            {
-                # utils.OPT_KEY: self._optimizer.state_dict(),
-                utils.SEED_KEY: self.seed,
-                utils.EPOCHS_KEY: self.epochs_run,
-                utils.TOTAL_EPOCHS_KEY: self.total_epochs,
-                utils.MAX_STEPS_KEY: self.max_steps_per_epoch,
-            }
-        )
-
-        # Move to CPU to avoid a copy on GPU
-        state_dict = {k: v.cpu() for k, v in self._model.state_dict().items()}
-
-        # Construct the full state dict with LoRA weights merged into base LLM weights
-        merged_state_dict = get_merged_lora_ckpt(
-            state_dict,
-            rank=self._lora_rank,
-            alpha=self._lora_alpha,
-        )
-        ckpt_dict.update({utils.MODEL_KEY: {}})
-
-        # Construct the adapter weights
-        def adapter_key_filter(x): return x in self.adapter_params
-        adapter_state_dict = {
-            k: v for k, v in self._model.state_dict().items() if adapter_key_filter(k)
-        }
-        ckpt_dict.update({utils.ADAPTER_KEY: adapter_state_dict})
-        self._checkpointer.save_checkpoint(
-            ckpt_dict,
-            epoch=step,
-            intermediate_checkpoint=False,
-        )
-
-    def concatenated_forward(
-        self, model: nn.Module, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Run forward pass of the model with chosen and rejected samples concatenated.
-
-        Args:
-            model (nn.Module): The model to be used for the forward pass.
-            batch (Tuple[torch.Tensor, torch.Tensor]): Tuple of input_ids and labels.
-
-        Returns:
-            Tuple of chosen log probs, rejected log probs, chosen logits, rejected logits.
-        """
-        concatenated_input_ids, concatenated_labels = batch
-        concatenated_input_ids = concatenated_input_ids.to(self._device)
-        concatenated_labels = concatenated_labels.to(self._device)
-
-        # formed by concatenating an equal number of "chosen" and "rejected".
-        len_chosen = concatenated_input_ids.shape[0] // 2
-
-        all_logits = model(concatenated_input_ids)
-
-        all_log_probs = self.get_batch_log_probs(
-            all_logits, concatenated_labels)
-
-        chosen_log_probs = all_log_probs[:len_chosen]
-        rejected_log_probs = all_log_probs[len_chosen:]
-
-        chosen_logits = all_logits[:len_chosen]
-        rejected_logits = all_logits[len_chosen:]
-
-        return (chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits)
-
-    @staticmethod
-    def get_batch_log_probs(
-        logits: torch.FloatTensor,
-        labels: torch.LongTensor,
-        label_pad_token_id: int = CROSS_ENTROPY_IGNORE_IDX,
-    ) -> torch.FloatTensor:
-        """
-        Calculate log probabilities based on provided logits and labels.
-
-        Args:
-            logits (torch.FloatTensor): direct logits output of the model of shape (b, s, v)
-            labels (torch.LongTensor): ground-truth labels to compute log probs with, shape (b, s).
-                Label tokens with a value of label_pad_token_id are ignored.
-            label_pad_token_id (int): token id to ignore in labels.
-
-        Returns:
-            Calculated log probs of shape (b, )
-
-        Raises:
-            ValueError: If logits and labels have different shapes.
-        """
-
-        if logits.shape[:-1] != labels.shape:
-            raise ValueError(
-                "Logits (batch and sequence length dim) and labels must have the same shape."
-            )
-
-        labels = labels[:, 1:].clone()
-        logits = logits[:, :-1, :]
-        loss_mask = labels != label_pad_token_id
-
-        labels[labels == label_pad_token_id] = 0
-        # take log-likelihood of the labels given our model
-        per_token_log_probs = torch.gather(
-            logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
-        ).squeeze(2)
-
-        return (per_token_log_probs * loss_mask).sum(-1)
-
-    def train(self) -> None:
-        """
-        The core training loop.
-        """
-
-        # Initialize tokens count and running loss (for grad accumulation)
-        t0 = time.perf_counter()
-        running_loss = 0
-        num_tokens = 0
-
-        # self.epochs_run should be non-zero when we're resuming from a checkpoint
-        for curr_epoch in range(self.epochs_run, self.total_epochs):
-            # Update the sampler to ensure data is correctly shuffled across epochs
-            # in case shuffle is True
-            self._sampler.set_epoch(curr_epoch)
-            pbar = tqdm(total=self._steps_per_epoch)
-            for idx, batch in enumerate(self._dataloader):
-                if (
-                    self.max_steps_per_epoch is not None
-                    and (idx // self._gradient_accumulation_steps)
-                    == self.max_steps_per_epoch
-                ):
-                    break
-
-                if idx % self._eval_freq == 0:
-                    # Print the first training input decoded
-                    self.eval_custom_prompts(iteration=curr_epoch, step=idx)
-                    self.eval_pc(iteration=curr_epoch, step=idx)
-                    log.info(
-                        f"Saving checkpoint at {curr_epoch}_{str(idx).zfill(4)}")
-                    self.save_checkpoint(
-                        step=f"{curr_epoch}_{str(idx).zfill(4)}")
-                    sys.stdout.flush()
-
-                # batch is input_ids, labels
-                num_tokens += batch[0].numel()
-                (
-                    policy_chosen_log_probs,
-                    policy_rejected_log_probs,
-                    policy_chosen_logits,
-                    policy_rejected_logits,
-                ) = self.concatenated_forward(self._model, batch)
-
-                with torch.no_grad(), disable_adapter(self._model):
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(self._model, batch)
-
-                loss, chosen_rewards, rejected_rewards = self._loss_fn(
-                    policy_chosen_log_probs,
-                    policy_rejected_log_probs,
-                    reference_chosen_log_probs,
-                    reference_rejected_log_probs,
-                )
-                loss = loss.mean()
-
-                loss = loss / self._gradient_accumulation_steps
-                running_loss += loss
-                loss.backward()
-
-                # Step with optimizer
-                if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
-                    self._lr_scheduler.step()
-                    # Update the number of steps when the weights are updated
-                    self.global_step += 1
-
-                    loss_to_log = running_loss.item()
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch+1}|{self.global_step}|Loss: {loss_to_log}"
-                    )
-
-                    # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
-                    t0 = time.perf_counter()
-
-            self.epochs_run += 1
-
-    def cleanup(self) -> None:
-        self._metric_logger.close()
-
-
-@config.parse
-def recipe_main(cfg: DictConfig) -> None:
-    """
-    Entry point for the recipe.
-
-    Configurable parameters are read in the following order:
-        - Parameters specified in config (see available configs through ``tune ls``)
-        - Overwritten by arguments from the command-line
-    """
-    config.log_config(recipe_name="LoRADPORecipeSingleDevice", cfg=cfg)
-    recipe = LoRADPORecipeSingleDevice(cfg=cfg)
-    recipe.setup(cfg=cfg)
-    recipe.train()
-    recipe.cleanup()
+    
+    log.info(f"Dataset loaded with {len(train_dataset)} samples")
+    
+    # Setup evaluation
+    pc_questions, pc_csv_file = setup_pc_evaluation(output_dir, tokenizer)
+    formatted_custom_prompts, custom_prompts_file = setup_custom_prompts_evaluation(output_dir, tokenizer)
+    
+    # DPO Training arguments
+    training_args = DPOConfig(
+        output_dir=output_dir,
+        num_train_epochs=training_config.get("epochs", 4),
+        per_device_train_batch_size=training_config.get("batch_size", 4),
+        gradient_accumulation_steps=training_config.get("gradient_accumulation_steps", 16),
+        learning_rate=training_config.get("learning_rate", 5e-4),
+        weight_decay=training_config.get("weight_decay", 0.05),
+        warmup_steps=training_config.get("warmup_steps", 100),
+        lr_scheduler_type=training_config.get("lr_scheduler_type", "cosine"),
+        logging_steps=training_config.get("logging_steps", 1),
+        save_steps=training_config.get("save_steps", 500),
+        save_total_limit=training_config.get("save_total_limit", 3),
+        bf16=torch_dtype == torch.bfloat16,
+        fp16=torch_dtype == torch.float16,
+        gradient_checkpointing=training_config.get("gradient_checkpointing", True),
+        max_length=max_seq_length,
+        max_prompt_length=max_seq_length // 2,
+        beta=dpo_config.get("beta", 0.1),
+        loss_type=dpo_config.get("loss_type", "sigmoid"),
+        label_smoothing=dpo_config.get("label_smoothing", 0.0),
+        seed=seed if seed is not None else 42,
+        report_to=training_config.get("report_to", "none"),
+        remove_unused_columns=False,
+    )
+    
+    # Initialize trainer with custom evaluation
+    trainer = DPOTrainerWithEval(
+        model=model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        processing_class=tokenizer,
+        peft_config=None,  # Already applied
+        eval_freq=eval_config.get("eval_freq", 64),
+        pc_questions=pc_questions,
+        pc_csv_file=pc_csv_file,
+        custom_prompts_list=formatted_custom_prompts,
+        custom_prompts_file=custom_prompts_file,
+        max_generated_tokens=eval_config.get("max_generated_tokens", 300),
+        temperature=eval_config.get("temperature", 0.3),
+        top_k=eval_config.get("top_k", 200),
+    )
+    
+    # Run evaluation before training
+    device = next(model.parameters()).device
+    log.info("Running initial evaluation...")
+    eval_pc(
+        pc_questions=pc_questions,
+        pc_csv_file=pc_csv_file,
+        model=model,
+        tokenizer=tokenizer,
+        max_generated_tokens=eval_config.get("max_generated_tokens", 300),
+        temperature=eval_config.get("temperature", 0.3),
+        top_k=eval_config.get("top_k", 200),
+        iteration=0,
+        step=0,
+        device=str(device),
+    )
+    eval_custom_prompts(
+        custom_prompts=formatted_custom_prompts,
+        custom_prompts_file=custom_prompts_file,
+        model=model,
+        tokenizer=tokenizer,
+        max_generated_tokens=eval_config.get("max_generated_tokens", 300),
+        temperature=eval_config.get("temperature", 0.3),
+        top_k=eval_config.get("top_k", 200),
+        iteration=0,
+        step=0,
+        device=str(device),
+    )
+    
+    # Train
+    log.info("Starting DPO training...")
+    trainer.train()
+    
+    # Save final model
+    log.info("Saving final model...")
+    trainer.save_model(os.path.join(output_dir, "final_model"))
+    tokenizer.save_pretrained(os.path.join(output_dir, "final_model"))
+    
+    # Run final evaluation
+    log.info("Running final evaluation...")
+    eval_pc(
+        pc_questions=pc_questions,
+        pc_csv_file=pc_csv_file,
+        model=model,
+        tokenizer=tokenizer,
+        max_generated_tokens=eval_config.get("max_generated_tokens", 300),
+        temperature=eval_config.get("temperature", 0.3),
+        top_k=eval_config.get("top_k", 200),
+        iteration=training_config.get("epochs", 4),
+        step=-1,
+        device=str(device),
+    )
+    eval_custom_prompts(
+        custom_prompts=formatted_custom_prompts,
+        custom_prompts_file=custom_prompts_file,
+        model=model,
+        tokenizer=tokenizer,
+        max_generated_tokens=eval_config.get("max_generated_tokens", 300),
+        temperature=eval_config.get("temperature", 0.3),
+        top_k=eval_config.get("top_k", 200),
+        iteration=training_config.get("epochs", 4),
+        step=-1,
+        device=str(device),
+    )
+    
+    log.info("DPO Training complete!")
 
 
 if __name__ == "__main__":
-    sys.exit(recipe_main())
+    main()

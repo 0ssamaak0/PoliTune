@@ -1,0 +1,41 @@
+{
+    "model": {
+        "name_or_path": "mistralai/Mistral-7B-Instruct-v0.2",
+        "torch_dtype": "bfloat16",
+        "use_flash_attention_2": false
+    },
+    "lora": {
+        "r": 16,
+        "alpha": 32,
+        "dropout": 0.05,
+        "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    },
+    "training": {
+        "epochs": 2,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 8,
+        "learning_rate": 3e-4,
+        "weight_decay": 0.01,
+        "warmup_steps": 100,
+        "lr_scheduler_type": "cosine",
+        "logging_steps": 10,
+        "save_steps": 500,
+        "save_total_limit": 3,
+        "gradient_checkpointing": true,
+        "report_to": "none"
+    },
+    "dataset": {
+        "name": "tatsu-lab/alpaca",
+        "max_seq_length": 1024,
+        "max_samples": null
+    },
+    "evaluation": {
+        "eval_freq": 64,
+        "max_generated_tokens": 300,
+        "temperature": 0.3,
+        "top_k": 200
+    },
+    "output_dir": "outputs/mistral7b_sft",
+    "seed": 42
+}
+
