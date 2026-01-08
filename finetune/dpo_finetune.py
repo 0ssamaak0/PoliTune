@@ -1,634 +1,433 @@
-# Portions Copyright (c) Meta Platforms, Inc. and affiliates.
-# This source code is licensed under the BSD-style license found in LICENSE-BSD.
-#
-# Modifications Copyright (c) SCALE Lab, Brown University.
-# These modifications are licensed under the MIT license (see LICENSE).
+# Copyright (c) 2024 SCALE Lab, Brown University
+# Licensed under the MIT License (see LICENSE for details).
 
-import csv
-from finetune.utils import pc_instruction, pc_questions_txt_file, custom_prompts, format_instruction, eval_pc, eval_custom_prompts, clean_output
-from torchtune.modules import KVCache
-from torchtune.data import AlpacaInstructTemplate
-from tqdm import tqdm
-from torchtune.recipe_interfaces import FTRecipeInterface
-from torchtune.modules.peft.peft_utils import (
-    disable_adapter,
-    get_adapter_params,
-    get_merged_lora_ckpt,
-    set_trainable_params,
-    validate_state_dict_for_lora,
-)
-from torchtune.datasets import ConcatDataset
-from torchtune.data import CROSS_ENTROPY_IGNORE_IDX
-from torchtune import config, modules, utils
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim import Optimizer
-from torch import nn
-from omegaconf import DictConfig, ListConfig
-import torch
-from warnings import warn
-from typing import Any, Dict, Optional, Tuple
-from functools import partial
-import sys
-import time
 import os
+import sys
+import csv
+import argparse
+import torch
+import logging
+from typing import Optional
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    BitsAndBytesConfig,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import DPOConfig, DPOTrainer
 
-dir_path = os.path.dirname(os.path.realpath(__file__))
-parent_dir_path = os.path.abspath(os.path.join(dir_path, os.pardir))
-sys.path.insert(0, dir_path)
-sys.path.insert(0, parent_dir_path)
+from finetune.utils import (
+    pc_instruction,
+    pc_questions_txt_file,
+    custom_prompts,
+    eval_pc_hf,
+    eval_custom_prompts_hf,
+    setup_logging,
+)
+
+logger = logging.getLogger(__name__)
 
 
-log = utils.get_logger("DEBUG")
+def parse_args():
+    parser = argparse.ArgumentParser(description="DPO Fine-tuning with LoRA")
+    
+    # Model arguments
+    parser.add_argument("--model_name_or_path", type=str, required=True,
+                        help="Path to pretrained model or model identifier from huggingface.co/models")
+    parser.add_argument("--tokenizer_name", type=str, default=None,
+                        help="Pretrained tokenizer name or path if different from model")
+    
+    # Dataset arguments
+    parser.add_argument("--dataset_name", type=str, default="scale-lab/politune-left",
+                        choices=["scale-lab/politune-left", "scale-lab/politune-right"],
+                        help="The preference dataset to use")
+    parser.add_argument("--max_seq_length", type=int, default=1024,
+                        help="Maximum sequence length")
+    parser.add_argument("--max_prompt_length", type=int, default=512,
+                        help="Maximum prompt length")
+    
+    # LoRA arguments
+    parser.add_argument("--lora_r", type=int, default=16,
+                        help="LoRA attention dimension (rank)")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                        help="LoRA alpha parameter")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout probability")
+    parser.add_argument("--lora_target_modules", type=str, nargs="+",
+                        default=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                        help="Target modules for LoRA")
+    
+    # DPO arguments
+    parser.add_argument("--beta", type=float, default=0.1,
+                        help="DPO beta parameter")
+    parser.add_argument("--loss_type", type=str, default="sigmoid",
+                        choices=["sigmoid", "hinge", "ipo", "kto_pair"],
+                        help="DPO loss type")
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for DPO")
+    
+    # Training arguments
+    parser.add_argument("--output_dir", type=str, default="./outputs",
+                        help="Output directory for model and logs")
+    parser.add_argument("--num_train_epochs", type=int, default=4,
+                        help="Number of training epochs")
+    parser.add_argument("--max_steps", type=int, default=-1,
+                        help="Maximum number of training steps (-1 for full training)")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4,
+                        help="Batch size per device during training")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16,
+                        help="Number of gradient accumulation steps")
+    parser.add_argument("--learning_rate", type=float, default=5e-4,
+                        help="Initial learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.05,
+                        help="Weight decay coefficient")
+    parser.add_argument("--warmup_steps", type=int, default=100,
+                        help="Number of warmup steps")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine",
+                        help="Learning rate scheduler type")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+    
+    # Precision and optimization
+    parser.add_argument("--bf16", action="store_true",
+                        help="Use bfloat16 precision")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Use float16 precision")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing")
+    parser.add_argument("--use_4bit", action="store_true",
+                        help="Use 4-bit quantization (QLoRA)")
+    parser.add_argument("--use_8bit", action="store_true",
+                        help="Use 8-bit quantization")
+    
+    # Logging and saving
+    parser.add_argument("--logging_steps", type=int, default=1,
+                        help="Log every N steps")
+    parser.add_argument("--save_steps", type=int, default=500,
+                        help="Save checkpoint every N steps")
+    parser.add_argument("--eval_steps", type=int, default=64,
+                        help="Evaluate every N steps")
+    parser.add_argument("--save_total_limit", type=int, default=3,
+                        help="Limit total number of checkpoints")
+    
+    # Evaluation
+    parser.add_argument("--eval_freq", type=int, default=64,
+                        help="Evaluation frequency for political compass")
+    parser.add_argument("--max_generated_tokens", type=int, default=300,
+                        help="Maximum tokens to generate during evaluation")
+    parser.add_argument("--temperature", type=float, default=0.3,
+                        help="Temperature for generation")
+    parser.add_argument("--top_k", type=int, default=200,
+                        help="Top-k for generation")
+    
+    # Resume training
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    
+    # WandB
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="Use Weights & Biases for logging")
+    parser.add_argument("--wandb_project", type=str, default="politune",
+                        help="WandB project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="WandB run name")
+    
+    return parser.parse_args()
 
 
-class LoRADPORecipeSingleDevice(FTRecipeInterface):
-    """
-    LoRA DPO recipe for dense transformer-based LLMs such as Llama2 for
-    single device training. This is based on HF's DPOTrainer in the
-    TRL library: https://github.com/huggingface/trl/blob/main/trl/trainer/dpo_trainer.py#L65
+def get_quantization_config(args):
+    """Get quantization config if using 4-bit or 8-bit."""
+    if args.use_4bit:
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if args.bf16 else torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+    elif args.use_8bit:
+        return BitsAndBytesConfig(load_in_8bit=True)
+    return None
 
-    This recipe supports:
-        - Activation checkpointing. This is enabled by default but is configurable.
-        - Full bf16 training for supported HW architectures. We currently check bf16 support via
-        the `torch.cuda.is_bf16_supported` API. This is disabled by default but can be enabled via
-        setting `dtype=bf16` in configuration.
-        - Checkpointing: of LoRA adapter parameters and their optimizer states. When resuming
-            from a checkpoint, the adapter parameters are loaded from the checkpoint along
-            with the base model weights. Note that intra-epoch resumption is not supported.
-        - Logging to terminal, WandB, or TensorBoard.
 
-    Assumptions:
-        - Checkpoints are ONLY saved at epoch boundaries. In case of failure, work done
-            in ongoing epoch is lost.
-        - Datasets are Map-style and data fits in memory (not streamed).
+def get_peft_config(args):
+    """Get PEFT/LoRA configuration."""
+    return LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=args.lora_target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
 
-    The following configs can be used to run this recipe:
-        >>> tune ls
-        RECIPE                          CONFIG
-        lora_dpo_single_device          llama2/7B_lora_dpo_single_device
 
-    Args:
-        cfg (DictConfig): OmegaConf object parsed from yaml file
+def load_model_and_tokenizer(args):
+    """Load model and tokenizer with optional quantization."""
+    logger.info(f"Loading model: {args.model_name_or_path}")
+    
+    quantization_config = get_quantization_config(args)
+    
+    # Determine dtype
+    if args.bf16:
+        torch_dtype = torch.bfloat16
+    elif args.fp16:
+        torch_dtype = torch.float16
+    else:
+        torch_dtype = torch.float32
+    
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        quantization_config=quantization_config,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+        device_map="auto" if quantization_config else None,
+    )
+    
+    # Prepare model for k-bit training if using quantization
+    if quantization_config:
+        model = prepare_model_for_kbit_training(model)
+    
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+    
+    # Load tokenizer
+    tokenizer_name = args.tokenizer_name or args.model_name_or_path
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=True,
+    )
+    
+    # Set padding token if not set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Set padding side to left for generation
+    tokenizer.padding_side = "left"
+    
+    return model, tokenizer
 
-    Raises:
-        ValueError: If ``dtype`` is set to fp16.
-        RuntimeError: If ``dtype`` is set to bf16 and the hardware does not support bf16.
 
-    """
+def load_and_prepare_dataset(args, tokenizer):
+    """Load and prepare the preference dataset."""
+    logger.info(f"Loading dataset: {args.dataset_name}")
+    
+    dataset = load_dataset(args.dataset_name, split="train")
+    
+    # The dataset should have 'prompt', 'chosen', 'rejected' columns
+    # If the columns are named differently, rename them
+    if "prompt" not in dataset.column_names:
+        if "instruction" in dataset.column_names:
+            dataset = dataset.rename_column("instruction", "prompt")
+    
+    logger.info(f"Dataset loaded with {len(dataset)} examples")
+    logger.info(f"Dataset columns: {dataset.column_names}")
+    
+    return dataset
 
-    def __init__(self, cfg: DictConfig) -> None:
 
-        self._device = utils.get_device(device=cfg.device)
-        # Reduced precision logic
-        self._dtype = utils.get_dtype(cfg.dtype, device=self._device)
-        # fp16 precision is explicitly disabled as it is not supported in this
-        # recipe (for example, no gradient scaling).
-        if self._dtype == torch.float16:
-            raise ValueError(
-                "fp16 precision is not supported in this recipe. Please use fp32 or bf16."
+def setup_evaluation_tracking(args):
+    """Set up CSV files for tracking evaluation results."""
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Load PC questions
+    pc_questions = []
+    with open(pc_questions_txt_file, "r") as f:
+        for line in f:
+            pc_questions.append(line.strip())
+    
+    # Set up PC CSV
+    pc_csv_file = os.path.join(args.output_dir, "pc.csv")
+    pc_headers = ['iteration', 'step'] + [f"question_{i}" for i in range(len(pc_questions))]
+    with open(pc_csv_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(pc_headers)
+    
+    # Set up custom prompts CSV
+    custom_prompts_file = os.path.join(args.output_dir, "custom_instrs.csv")
+    headers = ['iteration', 'step'] + [f"prompt_{i}" for i in range(len(custom_prompts))]
+    with open(custom_prompts_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+    
+    return pc_questions, pc_csv_file, custom_prompts_file
+
+
+class EvalCallback:
+    """Callback for running political compass evaluation during training."""
+    
+    def __init__(self, model, tokenizer, pc_questions, pc_csv_file, 
+                 custom_prompts_list, custom_prompts_file, args):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.pc_questions = pc_questions
+        self.pc_csv_file = pc_csv_file
+        self.custom_prompts_list = custom_prompts_list
+        self.custom_prompts_file = custom_prompts_file
+        self.args = args
+        self.last_eval_step = -args.eval_freq
+    
+    def __call__(self, step, epoch=0):
+        if step - self.last_eval_step >= self.args.eval_freq:
+            logger.info(f"Running evaluation at step {step}")
+            
+            # Evaluate PC
+            eval_pc_hf(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                pc_questions=self.pc_questions,
+                pc_csv_file=self.pc_csv_file,
+                max_generated_tokens=self.args.max_generated_tokens,
+                temperature=self.args.temperature,
+                top_k=self.args.top_k,
+                iteration=epoch,
+                step=step,
             )
-        # For CUDA devices, check if the HW supports bf16 if bf16 is specified.
-        if (
-            self._dtype == torch.bfloat16
-            and self._device != torch.device("cpu")
-            and not torch.cuda.is_bf16_supported()
-        ):
-            raise RuntimeError(
-                "Full bf16 training is not supported on this hardware.")
-        # logging attributes
-        self._output_dir = cfg.output_dir
-        os.makedirs(self._output_dir, exist_ok=True)
-        self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
-        self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
-
-        # These are public properties which are updated by the checkpoint loader
-        # when ``resume_from_checkpoint`` is `True` or validated in tests
-        self.seed = utils.set_seed(seed=cfg.seed)
-        self.epochs_run = 0
-        self.total_epochs = cfg.epochs
-        self.max_steps_per_epoch = cfg.max_steps_per_epoch
-        self.global_step = 0
-
-        self._resume_from_checkpoint = cfg.resume_from_checkpoint
-        self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
-        self._template = AlpacaInstructTemplate()
-        self._pc_instruction = pc_instruction
-        self._pc_questions = []
-        with open(pc_questions_txt_file, "r") as f:
-            for line in f:
-                self._pc_questions.append(
-                    self.generate_pc_instruction(line.strip()))
-
-        self._custom_prompts = custom_prompts
-        self._custom_prompts = [self.format_instruction(
-            q) for q in self._custom_prompts]
-
-        self._pc_num_questions = len(self._pc_questions)
-        self._pc_csv_file = f"{self._output_dir}/pc.csv"
-        self._pc_headers = ['iteration', 'step'] + \
-            [f"question_{str(i)}" for i in range(self._pc_num_questions)]
-        with open(self._pc_csv_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self._pc_headers)
-
-        self._custom_prompts_file = f"{self._output_dir}/custom_instrs.csv"
-        headers = ['iteration', 'step'] + \
-            [f"prompt_{str(i)}" for i in range(len(self._custom_prompts))]
-        with open(self._custom_prompts_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-        self._eval_freq = cfg.get("eval_freq", 512)
-        self._max_generated_tokens = 300
-        self._temperature = 0.3
-        self._top_k = 200
-
-        log.info(f"Evaluation frequency: {self._eval_freq}")
-        log.info(f"Max generated tokens: {self._max_generated_tokens}")
-        log.info(f"Temperature: {self._temperature}")
-        log.info(f"Top k: {self._top_k}")
-
-    def format_instruction(self, instr, inp=""):
-        return format_instruction(self._template, instr, inp)
-
-    def generate_pc_instruction(self, question):
-        return self.format_instruction(self._pc_instruction, question)
-
-    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
-        """
-        Extract the checkpoint state from file and validate. This includes the
-        base model weights. If resume_from_checkpoint is True, this also includes
-        the adapter weights and recipe state
-        """
-        self._checkpointer = config.instantiate(
-            cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
-        )
-        checkpoint_dict = self._checkpointer.load_checkpoint()
-
-        if self._resume_from_checkpoint:
-            if utils.ADAPTER_KEY not in checkpoint_dict:
-                raise ValueError(
-                    "Adapter weights not found. Please ensure a valid adapter checkpoint is provided."
-                )
-            # _update_recipe_state will throw an exception if the recipe state is not correctly loaded
-            # no need to check here
-            self._update_recipe_state(checkpoint_dict)
-        return checkpoint_dict
-
-    def _update_recipe_state(self, ckpt_dict: Dict[str, Any]) -> None:
-        """
-        Updates the recipe state from checkpoint.
-        """
-        # If seed, total_epoch or max_steps_per_epoch don't match,
-        # warn the user and overwrite
-        if (
-            self.seed != ckpt_dict[utils.SEED_KEY]
-            or self.total_epochs != ckpt_dict[utils.TOTAL_EPOCHS_KEY]
-            or self.max_steps_per_epoch != ckpt_dict[utils.MAX_STEPS_KEY]
-        ):
-            warn(
-                message="""Configured value for seed, epochs or max_steps_per_epoch
-                does not match the value stored in checkpoint."""
+            
+            # Evaluate custom prompts
+            eval_custom_prompts_hf(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                custom_prompts=self.custom_prompts_list,
+                custom_prompts_file=self.custom_prompts_file,
+                max_generated_tokens=self.args.max_generated_tokens,
+                temperature=self.args.temperature,
+                top_k=self.args.top_k,
+                iteration=epoch,
+                step=step,
             )
-        self.seed = utils.set_seed(seed=ckpt_dict[utils.SEED_KEY])
-        self.epochs_run = ckpt_dict[utils.EPOCHS_KEY]
-        self.total_epochs = ckpt_dict[utils.TOTAL_EPOCHS_KEY]
-        self.max_steps_per_epoch = ckpt_dict[utils.MAX_STEPS_KEY]
-
-    def setup(self, cfg: DictConfig) -> None:
-        """
-        Setup the recipe state. This includes recipe state (if resume_from_checkpoint is True),
-        model, tokenizer, loss, optimizer, learning rate scheduler, sampler, and dataloader.
-        """
-        self._metric_logger = config.instantiate(cfg.metric_logger)
-
-        # log config with parameter override
-        self._metric_logger.log_config(cfg)
-
-        checkpoint_dict = self.load_checkpoint(
-            cfg_checkpointer=cfg.checkpointer)
-
-        self._model = self._setup_model(
-            cfg_model=cfg.model,
-            enable_activation_checkpointing=cfg.enable_activation_checkpointing,
-            base_model_state_dict=checkpoint_dict[utils.MODEL_KEY],
-            lora_weights_state_dict=(
-                checkpoint_dict[utils.ADAPTER_KEY]
-                if self._resume_from_checkpoint
-                else None
-            ),
-        )
-
-        self._tokenizer = config.instantiate(cfg.tokenizer)
-        log.info("Tokenizer is initialized from file.")
-
-        self._optimizer = self._setup_optimizer(
-            cfg_optimizer=cfg.optimizer,
-            opt_state_dict=(
-                checkpoint_dict[utils.OPT_KEY] if self._resume_from_checkpoint else None
-            ),
-        )
-
-        self._loss_fn = config.instantiate(cfg.loss)
-        log.info("Loss is initialized.")
-
-        # Dataloader depends on the tokenizer and loss_fn and should be
-        # setup after all of these are setup
-        self._sampler, self._dataloader = self._setup_data(
-            cfg_dataset=cfg.dataset,
-            shuffle=cfg.shuffle,
-            batch_size=cfg.batch_size,
-        )
-
-        # Finally update the recipe state which can only be correctly set after all of the
-        # other components have been initialized and updated.
-
-        # Number of training steps in each epoch depends on the number of batches produced
-        # by the dataloader and the max_steps_per_epoch param set by the user and is used
-        # for logging and tracking training state. This should be computed after the dataloader
-        # has been setup
-        self._steps_per_epoch = (
-            len(self._dataloader) // self._gradient_accumulation_steps
-        )
-        if (
-            self.max_steps_per_epoch is not None
-            and self.max_steps_per_epoch < self._steps_per_epoch
-        ):
-            self._steps_per_epoch = self.max_steps_per_epoch
-            self.global_step = self.epochs_run * self._steps_per_epoch
-
-        # Learning rate scheduler can only be set up after number of steps
-        # has been computed
-        self._lr_scheduler = self._setup_lr_scheduler(
-            cfg_lr_scheduler=cfg.lr_scheduler,
-            num_training_steps=self.total_epochs * self._steps_per_epoch,
-            last_epoch=self.global_step - 1,
-        )
-
-        self._pc_questions = [torch.tensor(self._tokenizer.encode(
-            q, add_bos=True, add_eos=False), dtype=torch.int, device=self._device).to(self._device) for q in self._pc_questions[:]]
-        self._custom_prompts = [torch.tensor(self._tokenizer.encode(
-            q, add_bos=True, add_eos=False), dtype=torch.int, device=self._device).to(self._device) for q in self._custom_prompts[:]]
-        self._causal_mask = torch.tril(
-            torch.ones(self._model.max_seq_len,
-                       self._model.max_seq_len, dtype=torch.bool)
-        ).to(self._device)
-        self._kv_cache = []
-        for _ in self._model.layers:
-            self._kv_cache.append(KVCache(
-                batch_size=1,
-                max_seq_len=self._model.max_seq_len,
-                num_heads=self._model.num_heads,
-                head_dim=self._model.head_dim,
-                dtype=self._dtype,
-            ).to(self._device))
-
-    def _setup_model(
-        self,
-        cfg_model: DictConfig,
-        enable_activation_checkpointing: bool,
-        base_model_state_dict: Dict[str, Any],
-        lora_weights_state_dict: Optional[Dict[str, Any]] = None,
-    ) -> nn.Module:
-        with utils.set_default_dtype(self._dtype), self._device:
-            model = config.instantiate(cfg_model)
-        self._lora_rank = cfg_model.lora_rank
-        self._lora_alpha = cfg_model.lora_alpha
-        self.adapter_params = get_adapter_params(model)
-        set_trainable_params(model, self.adapter_params)
-
-        if enable_activation_checkpointing:
-            utils.set_activation_checkpointing(
-                model, auto_wrap_policy={modules.TransformerDecoderLayer}
-            )
-
-        validate_state_dict_for_lora(
-            lora_attn_modules=cfg_model.lora_attn_modules,
-            apply_lora_to_mlp=cfg_model.apply_lora_to_mlp,
-            apply_lora_to_output=cfg_model.apply_lora_to_output,
-            full_model_state_dict_keys=model.state_dict().keys(),
-            lora_state_dict_keys=(
-                lora_weights_state_dict.keys()
-                if lora_weights_state_dict is not None
-                else None
-            ),
-            base_model_state_dict_keys=base_model_state_dict.keys(),
-        )
-
-        model.load_state_dict(base_model_state_dict, strict=False)
-        if lora_weights_state_dict:
-            model.load_state_dict(lora_weights_state_dict, strict=False)
-
-        # Validate model adapter params were loaded in with the expected dtype
-        # TODO (rohan-varma): Further validation to ensure the appropriate base params
-        # are NF4 vs bf16 based on the quantization config.
-        utils.validate_expected_param_dtype(
-            self.adapter_params.items(), dtype=self._dtype
-        )
-
-        log.info(f"Model is initialized with precision {self._dtype}.")
-        if self._device == torch.device("cuda"):
-            memory_stats = utils.get_memory_stats(device=self._device)
-            utils.log_memory_stats(memory_stats)
-        return model
-
-    def _setup_optimizer(
-        self, cfg_optimizer: DictConfig, opt_state_dict: Optional[Dict[str, Any]] = None
-    ) -> Optimizer:
-        optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
-        if opt_state_dict:
-            optimizer.load_state_dict(opt_state_dict)
-
-        log.info("Optimizer and loss are initialized.")
-        return optimizer
-
-    def _setup_lr_scheduler(
-        self,
-        cfg_lr_scheduler: DictConfig,
-        num_training_steps: int,
-        last_epoch: int,
-    ) -> Optimizer:
-        lr_scheduler = config.instantiate(
-            cfg_lr_scheduler,
-            self._optimizer,
-            num_training_steps=num_training_steps,
-            last_epoch=last_epoch,
-        )
-
-        log.info("Learning rate scheduler is initialized.")
-        return lr_scheduler
-
-    def _setup_data(
-        self,
-        cfg_dataset: DictConfig,
-        shuffle: bool,
-        batch_size: int,
-    ) -> Tuple[DistributedSampler, DataLoader]:
-        """
-        All data related setup happens here. Currently this recipe only supports
-        Map-style Datasets which fit into memory and an option for random shuffling.
-        Samplers, iterable datasets, and streaming datasets are not supported.
-        """
-        if isinstance(cfg_dataset, ListConfig):
-            datasets = [
-                config.instantiate(single_cfg_dataset,
-                                   tokenizer=self._tokenizer)
-                for single_cfg_dataset in cfg_dataset
-            ]
-            ds = ConcatDataset(datasets=datasets)
-        else:
-            ds = config.instantiate(cfg_dataset, tokenizer=self._tokenizer)
-
-        sampler = DistributedSampler(
-            ds,
-            num_replicas=1,
-            rank=0,
-            shuffle=shuffle,
-            seed=0,
-        )
-        dataloader = DataLoader(
-            dataset=ds,
-            sampler=sampler,
-            batch_size=batch_size,
-            collate_fn=partial(
-                utils.padded_collate_dpo,
-                padding_idx=self._tokenizer.pad_id,
-                ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
-            ),
-        )
-        log.info("Dataset and Sampler are initialized.")
-
-        return sampler, dataloader
-
-    def eval_pc(self, iteration=0, step=0):
-        return eval_pc(pc_questions=self._pc_questions, pc_csv_file=self._pc_csv_file, log=log, model=self._model, tokenizer=self._tokenizer, causal_mask=self._causal_mask, kv_cache=self._kv_cache, max_generated_tokens=self._max_generated_tokens, temperature=self._temperature, top_k=self._top_k, iteration=iteration, step=step)
-
-    def eval_custom_prompts(self, iteration=0, step=0):
-        return eval_custom_prompts(custom_prompts=self._custom_prompts, custom_prompts_file=self._custom_prompts_file, log=log, model=self._model, tokenizer=self._tokenizer, causal_mask=self._causal_mask, kv_cache=self._kv_cache, max_generated_tokens=self._max_generated_tokens, temperature=self._temperature, top_k=self._top_k, iteration=iteration, step=step)
-
-    def save_checkpoint(self, step: str) -> None:
-        """
-        Checkpoint the state of the recipe. The constructed checkpoint state dict
-        contains the following information:
-        - Merged weights with key MODEL_KEY
-        - Adapter weights with key ADAPTER_KEY
-        - Relevant recipe state if training is not complete
-
-        Checkpointer will save the merged weights, adapter weights and recipe state in
-        different checkpoint files. To correctly resume from training, the adapter weights
-        and recipe state must be provided along with the base model weights.
-        """
-        ckpt_dict = {}
-        # if training is in-progress, checkpoint the optimizer state as well
-        # if epoch + 1 < self.total_epochs:
-        ckpt_dict.update(
-            {
-                # utils.OPT_KEY: self._optimizer.state_dict(),
-                utils.SEED_KEY: self.seed,
-                utils.EPOCHS_KEY: self.epochs_run,
-                utils.TOTAL_EPOCHS_KEY: self.total_epochs,
-                utils.MAX_STEPS_KEY: self.max_steps_per_epoch,
-            }
-        )
-
-        # Move to CPU to avoid a copy on GPU
-        state_dict = {k: v.cpu() for k, v in self._model.state_dict().items()}
-
-        # Construct the full state dict with LoRA weights merged into base LLM weights
-        merged_state_dict = get_merged_lora_ckpt(
-            state_dict,
-            rank=self._lora_rank,
-            alpha=self._lora_alpha,
-        )
-        ckpt_dict.update({utils.MODEL_KEY: {}})
-
-        # Construct the adapter weights
-        def adapter_key_filter(x): return x in self.adapter_params
-        adapter_state_dict = {
-            k: v for k, v in self._model.state_dict().items() if adapter_key_filter(k)
-        }
-        ckpt_dict.update({utils.ADAPTER_KEY: adapter_state_dict})
-        self._checkpointer.save_checkpoint(
-            ckpt_dict,
-            epoch=step,
-            intermediate_checkpoint=False,
-        )
-
-    def concatenated_forward(
-        self, model: nn.Module, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Run forward pass of the model with chosen and rejected samples concatenated.
-
-        Args:
-            model (nn.Module): The model to be used for the forward pass.
-            batch (Tuple[torch.Tensor, torch.Tensor]): Tuple of input_ids and labels.
-
-        Returns:
-            Tuple of chosen log probs, rejected log probs, chosen logits, rejected logits.
-        """
-        concatenated_input_ids, concatenated_labels = batch
-        concatenated_input_ids = concatenated_input_ids.to(self._device)
-        concatenated_labels = concatenated_labels.to(self._device)
-
-        # formed by concatenating an equal number of "chosen" and "rejected".
-        len_chosen = concatenated_input_ids.shape[0] // 2
-
-        all_logits = model(concatenated_input_ids)
-
-        all_log_probs = self.get_batch_log_probs(
-            all_logits, concatenated_labels)
-
-        chosen_log_probs = all_log_probs[:len_chosen]
-        rejected_log_probs = all_log_probs[len_chosen:]
-
-        chosen_logits = all_logits[:len_chosen]
-        rejected_logits = all_logits[len_chosen:]
-
-        return (chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits)
-
-    @staticmethod
-    def get_batch_log_probs(
-        logits: torch.FloatTensor,
-        labels: torch.LongTensor,
-        label_pad_token_id: int = CROSS_ENTROPY_IGNORE_IDX,
-    ) -> torch.FloatTensor:
-        """
-        Calculate log probabilities based on provided logits and labels.
-
-        Args:
-            logits (torch.FloatTensor): direct logits output of the model of shape (b, s, v)
-            labels (torch.LongTensor): ground-truth labels to compute log probs with, shape (b, s).
-                Label tokens with a value of label_pad_token_id are ignored.
-            label_pad_token_id (int): token id to ignore in labels.
-
-        Returns:
-            Calculated log probs of shape (b, )
-
-        Raises:
-            ValueError: If logits and labels have different shapes.
-        """
-
-        if logits.shape[:-1] != labels.shape:
-            raise ValueError(
-                "Logits (batch and sequence length dim) and labels must have the same shape."
-            )
-
-        labels = labels[:, 1:].clone()
-        logits = logits[:, :-1, :]
-        loss_mask = labels != label_pad_token_id
-
-        labels[labels == label_pad_token_id] = 0
-        # take log-likelihood of the labels given our model
-        per_token_log_probs = torch.gather(
-            logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
-        ).squeeze(2)
-
-        return (per_token_log_probs * loss_mask).sum(-1)
-
-    def train(self) -> None:
-        """
-        The core training loop.
-        """
-
-        # Initialize tokens count and running loss (for grad accumulation)
-        t0 = time.perf_counter()
-        running_loss = 0
-        num_tokens = 0
-
-        # self.epochs_run should be non-zero when we're resuming from a checkpoint
-        for curr_epoch in range(self.epochs_run, self.total_epochs):
-            # Update the sampler to ensure data is correctly shuffled across epochs
-            # in case shuffle is True
-            self._sampler.set_epoch(curr_epoch)
-            pbar = tqdm(total=self._steps_per_epoch)
-            for idx, batch in enumerate(self._dataloader):
-                if (
-                    self.max_steps_per_epoch is not None
-                    and (idx // self._gradient_accumulation_steps)
-                    == self.max_steps_per_epoch
-                ):
-                    break
-
-                if idx % self._eval_freq == 0:
-                    # Print the first training input decoded
-                    self.eval_custom_prompts(iteration=curr_epoch, step=idx)
-                    self.eval_pc(iteration=curr_epoch, step=idx)
-                    log.info(
-                        f"Saving checkpoint at {curr_epoch}_{str(idx).zfill(4)}")
-                    self.save_checkpoint(
-                        step=f"{curr_epoch}_{str(idx).zfill(4)}")
-                    sys.stdout.flush()
-
-                # batch is input_ids, labels
-                num_tokens += batch[0].numel()
-                (
-                    policy_chosen_log_probs,
-                    policy_rejected_log_probs,
-                    policy_chosen_logits,
-                    policy_rejected_logits,
-                ) = self.concatenated_forward(self._model, batch)
-
-                with torch.no_grad(), disable_adapter(self._model):
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(self._model, batch)
-
-                loss, chosen_rewards, rejected_rewards = self._loss_fn(
-                    policy_chosen_log_probs,
-                    policy_rejected_log_probs,
-                    reference_chosen_log_probs,
-                    reference_rejected_log_probs,
-                )
-                loss = loss.mean()
-
-                loss = loss / self._gradient_accumulation_steps
-                running_loss += loss
-                loss.backward()
-
-                # Step with optimizer
-                if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
-                    self._lr_scheduler.step()
-                    # Update the number of steps when the weights are updated
-                    self.global_step += 1
-
-                    loss_to_log = running_loss.item()
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch+1}|{self.global_step}|Loss: {loss_to_log}"
-                    )
-
-                    # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
-                    t0 = time.perf_counter()
-
-            self.epochs_run += 1
-
-    def cleanup(self) -> None:
-        self._metric_logger.close()
-
-
-@config.parse
-def recipe_main(cfg: DictConfig) -> None:
-    """
-    Entry point for the recipe.
-
-    Configurable parameters are read in the following order:
-        - Parameters specified in config (see available configs through ``tune ls``)
-        - Overwritten by arguments from the command-line
-    """
-    config.log_config(recipe_name="LoRADPORecipeSingleDevice", cfg=cfg)
-    recipe = LoRADPORecipeSingleDevice(cfg=cfg)
-    recipe.setup(cfg=cfg)
-    recipe.train()
-    recipe.cleanup()
+            
+            self.last_eval_step = step
+
+
+def main():
+    args = parse_args()
+    
+    # Setup logging
+    setup_logging()
+    logger.info("Starting DPO fine-tuning")
+    logger.info(f"Arguments: {args}")
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Load model and tokenizer
+    model, tokenizer = load_model_and_tokenizer(args)
+    
+    # Get LoRA config
+    peft_config = get_peft_config(args)
+    logger.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}")
+    
+    # Load dataset
+    dataset = load_and_prepare_dataset(args, tokenizer)
+    
+    # Setup evaluation tracking
+    pc_questions, pc_csv_file, custom_prompts_file = setup_evaluation_tracking(args)
+    
+    # Configure DPO training
+    dpo_config = DPOConfig(
+        output_dir=args.output_dir,
+        num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
+        seed=args.seed,
+        bf16=args.bf16,
+        fp16=args.fp16,
+        gradient_checkpointing=args.gradient_checkpointing,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        max_length=args.max_seq_length,
+        max_prompt_length=args.max_prompt_length,
+        beta=args.beta,
+        loss_type=args.loss_type,
+        label_smoothing=args.label_smoothing,
+        report_to="wandb" if args.use_wandb else "none",
+        run_name=args.wandb_run_name,
+        remove_unused_columns=False,
+    )
+    
+    # Initialize trainer
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=None,  # Will use implicit reference model (adapter disabled)
+        args=dpo_config,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+    )
+    
+    # Run initial evaluation
+    logger.info("Running initial evaluation")
+    eval_pc_hf(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        pc_questions=pc_questions,
+        pc_csv_file=pc_csv_file,
+        max_generated_tokens=args.max_generated_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        iteration=0,
+        step=0,
+    )
+    eval_custom_prompts_hf(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        custom_prompts=custom_prompts,
+        custom_prompts_file=custom_prompts_file,
+        max_generated_tokens=args.max_generated_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        iteration=0,
+        step=0,
+    )
+    
+    # Train
+    logger.info("Starting training")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    
+    # Save final model
+    logger.info(f"Saving final model to {args.output_dir}")
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    
+    # Run final evaluation
+    logger.info("Running final evaluation")
+    eval_pc_hf(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        pc_questions=pc_questions,
+        pc_csv_file=pc_csv_file,
+        max_generated_tokens=args.max_generated_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        iteration=args.num_train_epochs,
+        step=-1,
+    )
+    eval_custom_prompts_hf(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        custom_prompts=custom_prompts,
+        custom_prompts_file=custom_prompts_file,
+        max_generated_tokens=args.max_generated_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        iteration=args.num_train_epochs,
+        step=-1,
+    )
+    
+    logger.info("Training completed!")
 
 
 if __name__ == "__main__":
-    sys.exit(recipe_main())
+    main()
